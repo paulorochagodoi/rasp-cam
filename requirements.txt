@@ -1,6 +1,5 @@
 # Core
 flask>=3.0
-flask-sock>=0.7
 
 # Camera
 picamera2>=0.3

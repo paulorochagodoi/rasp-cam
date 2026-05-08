@@ -1,11 +1,10 @@
 'use strict';
 
-// ── State ──────────────────────────────────────────────────────────────────
-let webrtcPc  = null;
-let webrtcWs  = null;
+// ── State ─────────────────────────────────────────────────────────────────
+let webrtcPc   = null;
 let mjpegActive = false;
 
-// ── Helpers ────────────────────────────────────────────────────────────────
+// ── DOM shortcuts ─────────────────────────────────────────────────────────
 const video     = () => document.getElementById('live-video');
 const mjpeg     = () => document.getElementById('mjpeg-frame');
 const indicator = () => document.getElementById('live-indicator');
@@ -32,15 +31,14 @@ function setMode(mode) {
 }
 
 function showError() {
-  video().style.display  = 'none';
-  mjpeg().style.display  = 'none';
+  video().style.display = 'none';
+  mjpeg().style.display = 'none';
   errorEl().classList.add('visible');
   setMode('error');
 }
 
-// ── WebRTC ─────────────────────────────────────────────────────────────────
+// ── WebRTC (P2P) ──────────────────────────────────────────────────────────
 function stopWebRTC() {
-  if (webrtcWs) { try { webrtcWs.close(); } catch (_) {} webrtcWs = null; }
   if (webrtcPc) { try { webrtcPc.close(); } catch (_) {} webrtcPc = null; }
   const v = video();
   if (v.srcObject) {
@@ -62,7 +60,7 @@ async function startWebRTC() {
     });
     webrtcPc = pc;
 
-    // Prefer H.264 when available to match server encoding
+    // Prefer H.264 to match the server's encoding pipeline
     const tx = pc.addTransceiver('video', { direction: 'recvonly' });
     if (RTCRtpReceiver.getCapabilities) {
       const caps = RTCRtpReceiver.getCapabilities('video');
@@ -90,29 +88,8 @@ async function startWebRTC() {
       }
     };
 
-    // Open WebSocket signaling channel
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${location.host}/ws/webrtc`);
-    webrtcWs = ws;
-
-    await new Promise((resolve, reject) => {
-      ws.onopen  = resolve;
-      ws.onerror = reject;
-      setTimeout(reject, 5000);
-    });
-
-    ws.onmessage = async (e) => {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'answer') {
-        await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-      }
-    };
-
-    ws.onclose = () => {
-      if (!video().srcObject) { stopWebRTC(); startMjpeg(); }
-    };
-
-    // Create offer and wait for ICE gathering to embed all candidates
+    // Create offer and wait for all local ICE candidates to be gathered
+    // before sending — this way the server can answer in one HTTP round-trip.
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
 
@@ -120,16 +97,24 @@ async function startWebRTC() {
       if (pc.iceGatheringState === 'complete') return resolve();
       const timeout = setTimeout(resolve, 3000);
       pc.onicegatheringstatechange = () => {
-        if (pc.iceGatheringState === 'complete') {
-          clearTimeout(timeout);
-          resolve();
-        }
+        if (pc.iceGatheringState === 'complete') { clearTimeout(timeout); resolve(); }
       };
     });
 
-    ws.send(JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp }));
+    // POST the complete offer — no WebSocket needed for signaling
+    const res = await fetch('/offer', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sdp: pc.localDescription.sdp, type: 'offer' }),
+    });
+    if (!res.ok) throw new Error(`/offer returned ${res.status}`);
 
-    // Wait up to 10 s for the video element to start playing
+    const answer = await res.json();
+    if (answer.error) throw new Error(answer.error);
+
+    await pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+
+    // Wait up to 10 s for the video element to actually start playing
     await new Promise((resolve, reject) => {
       video().addEventListener('playing', resolve, { once: true });
       setTimeout(reject, 10000);
@@ -145,7 +130,7 @@ async function startWebRTC() {
   }
 }
 
-// ── MJPEG fallback ─────────────────────────────────────────────────────────
+// ── MJPEG fallback ────────────────────────────────────────────────────────
 function stopMjpeg() {
   const m = mjpeg();
   m.src = '';
@@ -160,19 +145,15 @@ function startMjpeg() {
 
   const m = mjpeg();
   m.style.display = 'block';
-  // cache-bust so the browser re-fetches after a WebRTC failure
-  m.src = `/video_feed?t=${Date.now()}`;
+  m.src = `/video_feed?t=${Date.now()}`; // cache-bust after a WebRTC failure
   mjpegActive = true;
 
-  m.onerror = () => {
-    // retry after 3 s if the camera is not yet ready
-    if (mjpegActive) setTimeout(startMjpeg, 3000);
-  };
+  m.onerror = () => { if (mjpegActive) setTimeout(startMjpeg, 3000); };
 
   setMode('mjpeg');
 }
 
-// ── Main entry ─────────────────────────────────────────────────────────────
+// ── Main entry ────────────────────────────────────────────────────────────
 async function startStream() {
   setMode('connecting');
   stopMjpeg();
