@@ -3,24 +3,32 @@ import io
 import threading
 from typing import Optional
 
+import cv2
 import numpy as np
 
 
 class CameraStream:
     """
-    picamera2 wrapper that captures frames in a background thread and
-    exposes the latest frame to multiple consumers (MJPEG, WebRTC).
+    USB camera wrapper using OpenCV (V4L2) with a background capture thread
+    that shares the latest frame with multiple consumers (MJPEG, WebRTC).
     """
 
-    def __init__(self, width: int = 640, height: int = 480, framerate: int = 24):
-        from picamera2 import Picamera2
-
-        self._cam = Picamera2()
-        cfg = self._cam.create_video_configuration(
-            main={"size": (width, height), "format": "RGB888"},
-            controls={"FrameRate": float(framerate)},
-        )
-        self._cam.configure(cfg)
+    def __init__(
+        self,
+        width: int = 640,
+        height: int = 480,
+        framerate: int = 24,
+        device: int = 0,
+    ):
+        self._cap = cv2.VideoCapture(device)
+        if not self._cap.isOpened():
+            raise RuntimeError(
+                f"Could not open camera device {device}. "
+                "Check that the USB camera is connected and try /dev/video0, 1, ..."
+            )
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self._cap.set(cv2.CAP_PROP_FPS, framerate)
         self.width = width
         self.height = height
         self.framerate = framerate
@@ -29,7 +37,6 @@ class CameraStream:
         self._running = False
 
     def start(self) -> "CameraStream":
-        self._cam.start()
         self._running = True
         threading.Thread(
             target=self._capture_loop, daemon=True, name="camera-capture"
@@ -38,12 +45,15 @@ class CameraStream:
 
     def _capture_loop(self) -> None:
         while self._running:
-            arr = self._cam.capture_array()
-            with self._lock:
-                self._frame = arr
+            ret, bgr = self._cap.read()
+            if ret:
+                # cv2 returns BGR — convert to RGB for Pillow / aiortc
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                with self._lock:
+                    self._frame = rgb
 
     def get_frame(self) -> Optional[np.ndarray]:
-        """Return the latest captured frame as an RGB numpy array."""
+        """Return the latest frame as an RGB numpy array."""
         with self._lock:
             return self._frame
 
@@ -60,4 +70,4 @@ class CameraStream:
 
     def stop(self) -> None:
         self._running = False
-        self._cam.stop()
+        self._cap.release()
