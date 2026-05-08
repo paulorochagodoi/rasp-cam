@@ -1,36 +1,33 @@
 """Simple Raspberry Pi camera streaming server.
 
 Streaming strategy (in priority order):
-  1. WebRTC  — P2P via /ws/webrtc WebSocket (~100-400 ms latency)
+  1. WebRTC  — P2P via POST /offer + RTCPeerConnection (~100-400 ms latency)
   2. MJPEG   — HTTP multipart stream at /video_feed (universal fallback)
 
 The browser tries WebRTC first; if ICE negotiation or video playback fails
-within the timeout it transparently switches to the MJPEG endpoint.
+within the timeout it transparently switches to MJPEG.
+
+No WebSocket library is required — WebRTC signaling uses a plain HTTP POST.
 """
 from __future__ import annotations
 import asyncio
-import json
 import threading
 import time
 
-from flask import Flask, Response, send_from_directory
-from flask_sock import Sock
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 from camera import CameraStream
-from webrtc_peer import WebRTCPeer, _AIORTC_AVAILABLE
+from webrtc_peer import handle_offer, _AIORTC_AVAILABLE
 
 app = Flask(__name__, static_folder="web")
-sock = Sock(app)
 
 camera = CameraStream(width=640, height=480, framerate=24)
 camera.start()
 
-# Dedicated asyncio event loop — runs in a background thread so all
-# WebRTC peers share one loop without blocking Flask worker threads.
+# Dedicated asyncio loop for WebRTC peers — runs in a background thread so
+# it never blocks Flask worker threads.
 _loop = asyncio.new_event_loop()
-threading.Thread(
-    target=_loop.run_forever, daemon=True, name="webrtc-loop"
-).start()
+threading.Thread(target=_loop.run_forever, daemon=True, name="webrtc-loop").start()
 
 
 # ---------------------------------------------------------------------------
@@ -73,63 +70,33 @@ def _mjpeg_generator():
 
 
 # ---------------------------------------------------------------------------
-# WebRTC signaling (P2P)
+# WebRTC signaling — plain HTTP POST, no WebSocket library needed
 # ---------------------------------------------------------------------------
 
-@sock.route("/ws/webrtc")
-def ws_webrtc(ws):
-    """WebSocket endpoint for WebRTC offer/answer signaling."""
+@app.route("/offer", methods=["POST"])
+def webrtc_offer():
+    """
+    Receive a WebRTC SDP offer and return an SDP answer.
+
+    The browser waits for ICE gathering to complete before POSTing, so
+    the offer already contains all ICE candidates.  The server embeds
+    its own candidates in the answer before responding.
+    """
     if not _AIORTC_AVAILABLE:
-        ws.close(message="WebRTC unavailable: install aiortc and av")
-        return
+        return jsonify({"error": "WebRTC unavailable: install aiortc and av"}), 503
 
-    incoming: asyncio.Queue = asyncio.Queue()
-    outgoing: asyncio.Queue = asyncio.Queue()
-
-    def _sender():
-        """Forward outgoing WebRTC messages to the browser over the WebSocket."""
-        while True:
-            try:
-                fut = asyncio.run_coroutine_threadsafe(outgoing.get(), _loop)
-                msg = fut.result(timeout=10)
-                if msg is None:  # sentinel — peer closed
-                    break
-                ws.send(json.dumps(msg))
-            except Exception:
-                break
-
-    sender_t = threading.Thread(target=_sender, daemon=True)
-    sender_t.start()
-
-    session_fut = asyncio.run_coroutine_threadsafe(
-        _webrtc_session(incoming, outgoing), _loop
-    )
+    data = request.get_json(force=True)
+    if not data or "sdp" not in data:
+        return jsonify({"error": "Missing sdp field"}), 400
 
     try:
-        while True:
-            data = ws.receive(timeout=30)
-            if data is None:
-                break
-            _loop.call_soon_threadsafe(incoming.put_nowait, json.loads(data))
-    finally:
-        _loop.call_soon_threadsafe(outgoing.put_nowait, None)
-        session_fut.cancel()
-        sender_t.join(timeout=2)
-
-
-async def _webrtc_session(
-    incoming: asyncio.Queue, outgoing: asyncio.Queue
-) -> None:
-    """Async coroutine that owns one WebRTCPeer for the duration of a session."""
-    peer = WebRTCPeer(camera, outgoing)
-    try:
-        while True:
-            msg = await incoming.get()
-            if msg is None:
-                break
-            await peer.handle(msg)
-    finally:
-        await peer.close()
+        future = asyncio.run_coroutine_threadsafe(
+            handle_offer(camera, data["sdp"]), _loop
+        )
+        answer_sdp = future.result(timeout=15)
+        return jsonify({"type": "answer", "sdp": answer_sdp})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
 
 
 # ---------------------------------------------------------------------------

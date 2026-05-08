@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio
 import fractions
 import time
-from typing import Optional
+from typing import Optional, Set
 
 try:
     import av
@@ -20,8 +20,11 @@ except ImportError:
 
 STUN_SERVER = "stun:stun.l.google.com:19302"
 
+# Keep references so GC doesn't collect active peer connections
+_pcs: Set["RTCPeerConnection"] = set()
+
 # ---------------------------------------------------------------------------
-# Video track — wraps picamera2 frames for aiortc
+# Video track — feeds picamera2 frames into aiortc
 # ---------------------------------------------------------------------------
 
 if _AIORTC_AVAILABLE:
@@ -37,7 +40,6 @@ if _AIORTC_AVAILABLE:
 
         async def recv(self):  # type: ignore[override]
             loop = asyncio.get_event_loop()
-            # run blocking capture_array in a thread pool
             frame_arr = await loop.run_in_executor(None, self._camera.get_frame)
             if frame_arr is None:
                 await asyncio.sleep(0.05)
@@ -55,65 +57,52 @@ if _AIORTC_AVAILABLE:
             video_frame.pts = self._pts
             video_frame.time_base = self._time_base
 
-            # throttle to the configured framerate
             await asyncio.sleep(1 / self._camera.framerate)
             return video_frame
 
 
 # ---------------------------------------------------------------------------
-# Peer — manages one RTCPeerConnection per browser tab
+# Offer handler — called once per browser tab via POST /offer
 # ---------------------------------------------------------------------------
 
-class WebRTCPeer:
+async def handle_offer(camera, sdp: str) -> str:
     """
-    Manages one WebRTC peer connection.
+    Process a WebRTC SDP offer and return an SDP answer.
 
-    Signaling flow (browser is always the offerer):
-      browser  →  offer (SDP, full ICE)  →  handle()
-      webrtcbin creates answer            →  outgoing queue
-      browser  ←  answer (SDP, full ICE) ←  sender thread
+    Signaling flow (no WebSocket needed):
+      browser  POST /offer  {sdp}  →  this coroutine
+      browser  ←  {type:"answer", sdp}  ←  HTTP response
+
+    ICE candidates are embedded in both SDPs (full-trickle disabled),
+    so no additional signaling channel is required.
     """
+    if not _AIORTC_AVAILABLE:
+        raise RuntimeError("aiortc not installed — run: pip install aiortc av")
 
-    def __init__(self, camera, outgoing: asyncio.Queue) -> None:
-        if not _AIORTC_AVAILABLE:
-            raise RuntimeError(
-                "aiortc not installed. Run: pip install aiortc av"
-            )
-        self._pc = RTCPeerConnection(
-            configuration=RTCConfiguration(
-                iceServers=[RTCIceServer(urls=[STUN_SERVER])]
-            )
+    pc = RTCPeerConnection(
+        configuration=RTCConfiguration(
+            iceServers=[RTCIceServer(urls=[STUN_SERVER])]
         )
-        self._pc.addTrack(_CameraVideoTrack(camera))  # type: ignore[name-defined]
-        self._outgoing = outgoing
+    )
+    _pcs.add(pc)
+    pc.addTrack(_CameraVideoTrack(camera))  # type: ignore[name-defined]
 
-        @self._pc.on("connectionstatechange")
-        async def _on_state() -> None:
-            if self._pc.connectionState in ("failed", "closed"):
-                # signal the sender thread to stop
-                await self._outgoing.put(None)
+    @pc.on("connectionstatechange")
+    async def _cleanup() -> None:
+        if pc.connectionState in ("failed", "closed"):
+            await pc.close()
+            _pcs.discard(pc)
 
-    async def handle(self, msg: dict) -> None:
-        msg_type = msg.get("type")
+    await pc.setRemoteDescription(RTCSessionDescription(sdp=sdp, type="offer"))
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
 
-        if msg_type == "offer":
-            await self._pc.setRemoteDescription(
-                RTCSessionDescription(sdp=msg["sdp"], type="offer")
-            )
-            answer = await self._pc.createAnswer()
-            await self._pc.setLocalDescription(answer)
+    # Wait for ICE gathering (aiortc gathers asynchronously)
+    deadline = time.monotonic() + 5.0
+    while (
+        pc.iceGatheringState != "complete"
+        and time.monotonic() < deadline
+    ):
+        await asyncio.sleep(0.1)
 
-            # wait for ICE gathering to complete (aiortc gathers asynchronously)
-            deadline = time.monotonic() + 5.0
-            while (
-                self._pc.iceGatheringState != "complete"
-                and time.monotonic() < deadline
-            ):
-                await asyncio.sleep(0.1)
-
-            await self._outgoing.put(
-                {"type": "answer", "sdp": self._pc.localDescription.sdp}
-            )
-
-    async def close(self) -> None:
-        await self._pc.close()
+    return pc.localDescription.sdp
