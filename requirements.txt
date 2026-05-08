@@ -1,0 +1,12 @@
+# Core
+flask>=3.0
+flask-sock>=0.7
+
+# Camera
+picamera2>=0.3
+Pillow>=10.0
+numpy>=1.24
+
+# WebRTC P2P (optional — MJPEG fallback used if not installed)
+aiortc>=1.9
+av>=12.0
